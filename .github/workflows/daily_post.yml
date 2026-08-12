@@ -1,0 +1,132 @@
+name: Daily Instagram Post (@あなたのユーザーネーム)
+
+on:
+  # cron-job.org から workflow_dispatch 経由で起動する運用。
+  # A/Bテスト（8:00 / 12:30 JST）は cron-job.org 側で2ジョブを登録し、
+  # それぞれ time_slot を渡して発火する。GitHub Actions 側の schedule は使わない。
+  workflow_dispatch:
+    inputs:
+      time_slot:
+        description: "投稿スロット（A/Bテスト記録用。08:00 / 12:30 など）"
+        required: false
+        default: "manual"
+      pillar:
+        description: "柱を明示（A/B/C/D）。空なら日付で自動決定。"
+        required: false
+        default: ""
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download Noto Sans JP fonts
+        run: |
+          set -euo pipefail
+          mkdir -p inputs/fonts
+          TMP=$(mktemp -d)
+          curl -fsSL -o "$TMP/NotoSansJP.zip" \
+            "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/16_NotoSansJP.zip"
+          unzip -o "$TMP/NotoSansJP.zip" \
+            "NotoSansJP-Regular.otf" "NotoSansJP-Bold.otf" -d inputs/fonts
+          ls -lh inputs/fonts
+
+      - name: Generate post image & caption
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          POST_PILLAR: ${{ github.event.inputs.pillar }}
+          # 8:00 枠 / 12:30 枠のどちらかを本文生成にも伝える（未指定なら実行時刻から推定）
+          TIME_SLOT: ${{ github.event.inputs.time_slot }}
+          # PROMO_ENABLED: "true"   # note 公開後に柱D（販促）を解禁するならコメント解除
+        run: python content_generator.py
+
+      - name: Convert post.png to JPEG
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          src = Path("outputs/post.png")
+          dst = Path("outputs/post.jpg")
+          with Image.open(src) as im:
+              im.convert("RGB").save(dst, "JPEG", quality=92, optimize=True)
+          print(f"JPEG ready: {dst} ({dst.stat().st_size//1024} KB)")
+          PY
+
+      - name: Push image to public images repo
+        id: push_image
+        env:
+          IMAGES_REPO: ${{ vars.IMAGES_REPO }}
+          IMAGES_REPO_PAT: ${{ secrets.IMAGES_REPO_PAT }}
+        run: |
+          set -euo pipefail
+
+          echo "IMAGES_REPO            = '${IMAGES_REPO:-}'"
+          echo "IMAGES_REPO_PAT length = ${#IMAGES_REPO_PAT}"
+
+          if [ -z "${IMAGES_REPO:-}" ]; then
+            echo "❌ vars.IMAGES_REPO が空。Settings → Secrets and variables → Actions の Variables タブに IMAGES_REPO を登録してください"
+            exit 1
+          fi
+          if [ -z "${IMAGES_REPO_PAT:-}" ]; then
+            echo "❌ secrets.IMAGES_REPO_PAT が空。Settings → Secrets and variables → Actions の Secrets タブに IMAGES_REPO_PAT を登録してください"
+            exit 1
+          fi
+
+          REMOTE_URL="https://x-access-token:${IMAGES_REPO_PAT}@github.com/${IMAGES_REPO}.git"
+          WORKDIR=$(mktemp -d)
+
+          git clone --depth=1 "$REMOTE_URL" "$WORKDIR"
+          cd "$WORKDIR"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B main
+
+          cp "$GITHUB_WORKSPACE/outputs/post.jpg" post.jpg
+          cp "$GITHUB_WORKSPACE/outputs/caption.txt" caption.txt
+          git add post.jpg caption.txt
+          git commit -m "post image $(date -u +%Y%m%d-%H%M%S)"
+          git push origin main
+
+          COMMIT=$(git rev-parse HEAD)
+          URL="https://raw.githubusercontent.com/${IMAGES_REPO}/${COMMIT}/post.jpg"
+          echo "sha=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "image_url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "✅ Image at ${URL}"
+
+      - name: Post to Instagram
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
+          POST_IMAGE_URL: ${{ steps.push_image.outputs.image_url }}
+        run: python instagram_poster.py
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          GH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NOTIFY_BODY: "time_slot=${{ github.event.inputs.time_slot }} / pillar=${{ github.event.inputs.pillar }}"
+        run: python notify.py
+
+      - name: Upload artifacts (debug)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: post-outputs-${{ github.run_id }}
+          path: outputs/
+          retention-days: 7

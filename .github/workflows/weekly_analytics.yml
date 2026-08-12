@@ -1,0 +1,92 @@
+name: Weekly Analytics (@あなたのユーザーネーム)
+
+on:
+  # daily_post と同じく cron-job.org から workflow_dispatch で起動する運用。
+  #   推奨スケジュール: 毎週日曜 09:00 JST（= 日曜 00:00 UTC / crontab "0 0 * * 0"）
+  #   1週間分のエンゲージが溜まったタイミングで測定する。
+  # 初回だけ backfill を true にして手動実行し、稼働開始（2026-06-19）以降の
+  # 全投稿を一括で取り込む。
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "全投稿を遡って取得する（初回の取り込み用）。通常は false"
+        required: false
+        default: "false"
+
+# analytics/ の更新を main にコミットし返すため書き込み権限が必要
+permissions:
+  contents: write
+
+jobs:
+  analytics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Measure — Instagram インサイト取得
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
+          ANALYTICS_BACKFILL: ${{ github.event.inputs.backfill }}
+        run: python analytics_fetcher.py
+
+      - name: Analyze — 週次レポート生成（集計 + Claude 所見）
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python analytics_report.py
+
+      - name: Commit analytics back to repo
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analytics/
+          if git diff --cached --quiet; then
+            echo "変更なし — コミットをスキップ"
+          else
+            git commit -m "analytics: weekly report $(date -u +%Y%m%d-%H%M%S)"
+            git push origin HEAD:main
+            echo "✅ analytics/ を main にコミットしました"
+          fi
+
+      - name: Email — レポート送信（任意）
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          REPORT_EMAIL_TO: ${{ secrets.REPORT_EMAIL_TO }}
+          REPORT_EMAIL_FROM: ${{ secrets.REPORT_EMAIL_FROM }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: python email_report.py
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          GH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NOTIFY_SUBJECT: "[あなたのユーザーネーム] 週次インサイトの取得に失敗しました"
+          NOTIFY_BODY: "weekly_analytics / backfill=${{ github.event.inputs.backfill }}"
+        run: python notify.py
+
+      - name: Upload artifacts (debug)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: analytics-${{ github.run_id }}
+          path: analytics/
+          retention-days: 30
