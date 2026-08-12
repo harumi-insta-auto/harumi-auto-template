@@ -11,9 +11,9 @@ Instagram インサイト（Graph API）から数字を取得する。ポイン�
      @あなたのユーザーネーム は「Facebook ログインによる API 設定」で取得した
      **Page トークン + instagram_business_account ID** 方式のため
      **graph.facebook.com** を使う（instagram_poster.py と同じ）。
-  2. **A/B テストのスロット判定**を追加。投稿時刻（JST）から "08:00" / "12:30" を
+  2. **A/B テストのスロット判定**。投稿時刻（JST）から、どの投稿枠かを
      判定して各レコードに `slot` として持たせる。cron-job.org の2ジョブ
-     （8:00 / 12:30 JST）のどちらが効いているかを、後から集計できるようにするため。
+     どちらの枠が効いているかを、後から集計できるようにするため。窓は SLOT_WINDOWS で定義。
   3. **バックフィルモード**。`ANALYTICS_BACKFILL=true` で全投稿を遡って取得する
      （ページネーション対応）。稼働開始以降の全データを一度で取り込む用。
 
@@ -214,22 +214,45 @@ def _parse_created(ts_raw: str | None) -> datetime | None:
         return None
 
 
-def classify_slot(created: datetime | None) -> str:
-    """投稿時刻（JST）から A/B テストのスロットを判定する。
+# ==========================================================================
+# ★★ A/Bテストの投稿枠（ここを直せば、このファイルの時刻は全部変わります）★★
+# ==========================================================================
+# キー   = 枠の名前（レポートの見出しや集計のラベルに出ます）
+# 値     = その枠だと判定する時間帯（JST。"開始", "終了" の分単位）
+#
+# ⚠️ 幅を持たせているのは、**実際の公開時刻が数分〜十数分ずれる**ためです。
+#    cron が合図を送ってから、Actions が動き、Meta側の処理が終わるまで時間がかかります。
+#    ぴったりの時刻だけを拾おうとすると、集計から漏れます。
+# ⚠️ 手動の告知投稿が窓に入らないようにしてください。入ると "other" ではなく
+#    A/Bの集計に混ざり、比較が濁ります。
+#
+# ★投稿時刻を変えるときは、ここだけでなく**次の場所も揃えます**：
+#     ・cron-job.org のジョブの時刻（これが本体。ここを変えないと投稿時刻は変わりません）
+#     ・content_generator.py の TIME_SLOTS（その時刻に自分が何をしているか）
+#     ・analytics_report.py の SLOT_WINDOWS と SLOT_JP
+SLOT_WINDOWS = {
+    "08:00": (7 * 60 + 30, 9 * 60 + 30),   # 07:30–09:30 に公開されたものは朝の枠
+    "12:30": (12 * 60, 13 * 60 + 30),      # 12:00–13:30 に公開されたものは昼の枠
+}
+AB_SLOTS = tuple(SLOT_WINDOWS)  # A/Bで比べる枠（"other"・"unknown" は含めない）
 
-    cron-job.org は 8:00 / 12:30 JST に発火するが、Actions の実行と Meta 側の
-    処理で数分〜十数分ずれる。前後に幅を持たせて拾う。
-    手動投稿・告知投稿はどちらにも入らないので "other" になる。
+
+def _slot_from_minutes(minutes: int) -> str:
+    for name, (start, end) in SLOT_WINDOWS.items():
+        if start <= minutes <= end:
+            return name
+    return "other"
+
+
+def classify_slot(created: datetime | None) -> str:
+    """投稿時刻（JST）から A/B テストのスロットを判定する（窓は SLOT_WINDOWS）。
+
+    手動投稿・告知投稿はどの窓にも入らないので "other" になる。
     """
     if created is None:
         return "unknown"
     jst = created.astimezone(JST)
-    minutes = jst.hour * 60 + jst.minute
-    if 7 * 60 + 30 <= minutes <= 9 * 60 + 30:      # 07:30–09:30
-        return "08:00"
-    if 12 * 60 <= minutes <= 13 * 60 + 30:         # 12:00–13:30
-        return "12:30"
-    return "other"
+    return _slot_from_minutes(jst.hour * 60 + jst.minute)
 
 
 def _append_jsonl(path: Path, record: dict) -> None:

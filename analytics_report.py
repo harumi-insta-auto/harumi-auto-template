@@ -55,16 +55,28 @@ ACCOUNT_CONTEXT = """- （どんな立場の人が、どんな頻度で投稿し
 - （最終的な目的。例：フォロワー数を増やすこと／別の場所への導線として機能させること）
 - （すでに分かっている事実や、やらないと決めていること。書いておくと毎週蒸し返されません）"""
 
-# A/Bで比べる2つの投稿枠の呼び名。
+# ==========================================================================
+# ★★ A/Bテストの投稿枠（ここを直せば、このファイルの時刻は全部変わります）★★
+# ==========================================================================
+# キー   = 枠の名前 / 値 = (レポートでの呼び名, 判定する時間帯の開始, 終了)（JST・分単位）
 #
-# ★投稿時刻を変えたら、ここと `_slot_of()` の判定窓（下のほう）の両方を直します。
-#   キーは集計の見出しにもレポートにも出るので、時刻に合わせてください。
-SLOT_JP = {
-    "08:00": "朝 8:00 枠",
-    "12:30": "昼 12:30 枠",
-    "other": "その他（告知・手動）",
-    "unknown": "時刻不明",
+# ⚠️ 時間帯に幅を持たせているのは、**実際の公開時刻が数分〜十数分ずれる**ためです
+#    （cronが合図 → Actionsが起動 → Meta側の処理、と積み重なるので）。
+# ⚠️ 手動の告知投稿が窓に入らないようにしてください。入るとA/Bの比較が濁ります。
+#
+# ★投稿時刻を変えるときは、ここだけでなく**次の場所も揃えます**：
+#     ・cron-job.org のジョブの時刻（これが本体。ここを変えないと投稿時刻は変わりません）
+#     ・content_generator.py の TIME_SLOTS（その時刻に自分が何をしているか）
+#     ・analytics_fetcher.py の SLOT_WINDOWS
+SLOT_SPEC = {
+    "08:00": ("朝 8:00 枠", 7 * 60 + 30, 9 * 60 + 30),   # 07:30–09:30
+    "12:30": ("昼 12:30 枠", 12 * 60, 13 * 60 + 30),      # 12:00–13:30
 }
+AB_SLOTS = tuple(SLOT_SPEC)  # A/Bで比べる枠（"other"・"unknown" は含めない）
+
+SLOT_JP = {k: v[0] for k, v in SLOT_SPEC.items()}
+SLOT_JP["other"] = "その他（告知・手動）"
+SLOT_JP["unknown"] = "時刻不明"
 PRODUCT_TYPE_JP = {
     "FEED": "フィード画像",
     "REELS": "リール",
@@ -203,13 +215,9 @@ def _slot_of(p: dict) -> str:
         return "unknown"
     jst = created.astimezone(JST)
     minutes = jst.hour * 60 + jst.minute
-    # ★投稿時刻を変えたら、この判定窓と SLOT_JP の両方を直します。
-    #   窓に幅を持たせているのは、実際の公開時刻が数分ずれることがあるためです。
-    #   ⚠️ 手動の告知投稿を窓に入れないこと（"other" に落ちてA/B集計から除外されます）。
-    if 7 * 60 + 30 <= minutes <= 9 * 60 + 30:
-        return "08:00"
-    if 12 * 60 <= minutes <= 13 * 60 + 30:
-        return "12:30"
+    for name, (_label, start, end) in SLOT_SPEC.items():
+        if start <= minutes <= end:
+            return name
     return "other"
 
 
@@ -286,19 +294,19 @@ def build_data_section(account_rows, media_rows) -> tuple[str, dict]:
     lines.append("")
 
     # --- ★A/Bテスト（このアカウント観測の主目的） ---
-    auto_posts = [p for p in posts if _slot_of(p) in ("08:00", "12:30")]
+    auto_posts = [p for p in posts if _slot_of(p) in AB_SLOTS]
     by_slot: dict[str, list[dict]] = defaultdict(list)
     for p in auto_posts:
         by_slot[_slot_of(p)].append(p)
 
-    lines.append("## ★A/Bテスト — 朝 8:00 枠 vs 昼 12:30 枠（全期間）")
+    lines.append(f"## ★A/Bテスト — {' vs '.join(SLOT_JP[s] for s in AB_SLOTS)}（全期間）")
     if auto_posts:
         lines.append(f"- 自動投稿 **{len(auto_posts)}** 件が対象"
                      f"（告知・手動投稿 {len(posts) - len(auto_posts)} 件は除外）")
         lines.append("")
         lines.append("| 枠 | 本数 | 平均リーチ | 平均いいね | 平均コメント | 平均保存 | 平均エンゲージ | エンゲージ率 | 保存率 |")
         lines.append("|---|---|---|---|---|---|---|---|---|")
-        for slot in ("08:00", "12:30"):
+        for slot in AB_SLOTS:
             ps = by_slot.get(slot, [])
             if not ps:
                 continue
@@ -316,7 +324,7 @@ def build_data_section(account_rows, media_rows) -> tuple[str, dict]:
         lines.append("")
         lines.append("| 枠 | 区分 | 本数 | 平均リーチ | 平均いいね | 平均エンゲージ |")
         lines.append("|---|---|---|---|---|---|")
-        for slot in ("08:00", "12:30"):
+        for slot in AB_SLOTS:
             for label, want_weekend in (("平日", False), ("土日", True)):
                 ps = [p for p in by_slot.get(slot, []) if _is_weekend(p) is want_weekend]
                 if not ps:
@@ -442,12 +450,12 @@ def build_data_section(account_rows, media_rows) -> tuple[str, dict]:
         },
         "ab_test_slots": {
             SLOT_JP[slot]: _slot_stats(by_slot[slot])
-            for slot in ("08:00", "12:30") if by_slot.get(slot)
+            for slot in AB_SLOTS if by_slot.get(slot)
         },
         "ab_test_weekday_split": {
             f"{SLOT_JP[slot]}／{label}": _slot_stats(
                 [p for p in by_slot.get(slot, []) if _is_weekend(p) is want_weekend])
-            for slot in ("08:00", "12:30")
+            for slot in AB_SLOTS
             for label, want_weekend in (("平日", False), ("土日", True))
             if [p for p in by_slot.get(slot, []) if _is_weekend(p) is want_weekend]
         },
@@ -517,7 +525,7 @@ def build_insight_section(summary: dict) -> str:
 ## 今週の所見
 - （データから読み取れる事実を3〜5点。数字に基づき、憶測は避ける）
 
-## A/Bテスト（{SLOT_JP["08:00"]} vs {SLOT_JP["12:30"]}）の現時点の判定
+## A/Bテスト（{" vs ".join(SLOT_JP[s] for s in AB_SLOTS)}）の現時点の判定
 - （どちらが優勢か、または「まだ差が有意でない」か。**必ず本数（サンプル数）に触れる**。
   平日/土日の分割で傾向が変わるならそこも述べる。結論を急がないこと）
 
@@ -536,7 +544,7 @@ def build_insight_section(summary: dict) -> str:
 """
     try:
         msg = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
