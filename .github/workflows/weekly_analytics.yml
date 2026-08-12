@@ -4,7 +4,7 @@ on:
   # daily_post と同じく cron-job.org から workflow_dispatch で起動する運用。
   #   推奨スケジュール: 毎週日曜 09:00 JST（= 日曜 00:00 UTC / crontab "0 0 * * 0"）
   #   1週間分のエンゲージが溜まったタイミングで測定する。
-  # 初回だけ backfill を true にして手動実行し、稼働開始（2026-06-19）以降の
+  # 初回だけ backfill を true にして手動実行し、稼働開始以降の
   # 全投稿を一括で取り込む。
   workflow_dispatch:
     inputs:

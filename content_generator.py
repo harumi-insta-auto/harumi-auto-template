@@ -5,13 +5,13 @@
 このテンプレートは外部データ源を持たず、ネタ自体を Claude に生成させる。
 
 処理の流れ:
-  1. 柱の決定          : 日付で 柱A/B/C(/D) を決定論的にローテーション（設計書§5・ネタリスト比率 40/30/20/10）
+  1. 柱の決定          : 日付で 柱A/B/C(/D) を決定論的にローテーション（比率は PILLAR_SCHEDULE で調整）
   2. ネタ生成          : その日の柱に沿った見出し・キャプション・ハッシュタグ・表情を Claude に生成させる
   3. 表情画像の選択    : Claude の mood → assets/character/expr_*.png
-  4. 画像合成          : ブランドカラー（#1B2D4F / #FF7A45 / #D6EBF5）の 1080x1350 カード（ポートレート4:5）に見出し＋キャラを合成
+  4. 画像合成          : ブランドカラーの 1080x1350 カード（ポートレート4:5）に見出し＋キャラを合成
   5. 出力              : outputs/post.png / post.json / caption.txt / hashtags.txt
 
-出力 post.json スキーマ（流用元の poster と同じ契約）:
+出力 post.json スキーマ（instagram_poster.py が受け取る契約）:
   { caption, hashtags, post_text, image, media_type, pillar, mood }
 
 必要な環境変数:
@@ -21,7 +21,7 @@
   PROMO_ENABLED       "true" で柱D（販促）を解禁。既定は false（初期フェーズは抑制）
   POST_DATE           "YYYY-MM-DD" を明示（テスト用。未指定なら今日 JST）
 
-ローカル実行時は src/validation/.env があれば自動で読み込む（ANTHROPIC_API_KEY 再利用）。
+ローカル実行時は validation/.env があれば自動で読み込む（ANTHROPIC_API_KEY 再利用）。
 """
 from __future__ import annotations
 
@@ -44,9 +44,9 @@ OUT_DIR.mkdir(exist_ok=True)
 
 JST = ZoneInfo("Asia/Tokyo")
 
-# --- アセット解決（ローカル＝src/../assets, リポジトリ＝src直下にコピー想定） -------
-# 背景透過済みの transparent/ を最優先（src/tools/cutout_assets.py で生成）。
-# 無ければ淡ブルー背景の原画を使い、実行時に切り抜く。
+# --- アセット解決 ---------------------------------------------------------------
+# 背景透過済みの transparent/ を最優先（用意してあればそちらを使う）。
+# 無ければ背景つきの原画を使い、実行時に切り抜く。
 def _resolve_assets_dir() -> Path:
     candidates = [
         ROOT / "assets" / "character" / "transparent",          # リポジトリ配置・透過済み
@@ -61,13 +61,20 @@ def _resolve_assets_dir() -> Path:
 
 CHAR_DIR = _resolve_assets_dir()
 
-# --- ブランドカラー（設計書・CLAUDE.md） ----------------------------------------
-NAVY = (27, 45, 79)        # #1B2D4F オフィスネイビー
-NAVY_DARK = (18, 30, 54)   # グラデーション下端
-ORANGE = (255, 122, 69)    # #FF7A45 ウォームオレンジ
-LIGHT_BLUE = (214, 235, 245)  # #D6EBF5（キャラ背景と近い淡ブルー）
-WHITE = (245, 249, 252)
-TEXT_SUB = (170, 190, 215)
+# --- ブランドカラー -------------------------------------------------------------
+#
+# ★ここは書き換える場所です。
+#   下の色は**ただの仮置き**（グレー系）です。そのまま使うと、味気ないうえに
+#   他の人の投稿と見分けがつきません。**あなたのアカウントの色に変えてください。**
+#
+#   決め方に迷ったら、ベース1色＋アクセント1色の2色だけ決めれば十分です。
+#   ベース＝背景に敷く濃い色／アクセント＝目立たせたい一点に使う明るい色。
+#   Claude Code に「この2色でカードを作って」と伝えれば、残りは調整してくれます。
+BASE = (38, 42, 48)         # ベース色（背景の上端）
+BASE_DARK = (26, 29, 34)    # ベース色の暗いほう（背景の下端。グラデーションになる）
+ACCENT = (120, 140, 170)    # アクセント色（ユーザー名のピル・中心メッセージ・見出しの縦線）
+WHITE = (245, 249, 252)     # 見出しの文字色
+TEXT_SUB = (170, 180, 195)  # 補足（柱名）の文字色
 
 BRAND_HANDLE = "@あなたのユーザーネーム"
 
@@ -153,7 +160,7 @@ PILLARS = {
 # POST_DATE の年内通算日 % 10 で引く。初期は PROMO_ENABLED=false で D→A に置換。
 PILLAR_SCHEDULE = ["A", "B", "C", "A", "B", "A", "C", "B", "A", "D"]
 
-# mood（表情）→ assets/character/expr_*.png（ネタリスト「表情→柱/種別の対応ルール」）
+# mood（表情）→ assets/character/expr_*.png
 MOODS = {
     "happy":    "expr_happy.png",    # 成功・達成系
     "troubled": "expr_troubled.png", # 失敗・つまずき系
@@ -163,7 +170,7 @@ MOODS = {
     "working":  "expr_working.png",  # 中心物語の看板（自己紹介・オフィス）
 }
 
-# ハッシュタグ方針（2026-06-08 見直し）:
+# ハッシュタグ方針:
 #   現在の Instagram は 3〜5 個が推奨。毎回同一タグの羅列はスパム判定リスクもある。
 #   → ブランド核タグ（CORE）を常設し、残りを投稿固有タグで埋め、合計 MAX_HASHTAGS 個に制限。
 MAX_HASHTAGS = 5
@@ -230,7 +237,7 @@ PERSONA = (
 #   自分の中心メッセージと矛盾する語を入れてください。空リストでも動きます。
 NG_PHRASES = []
 
-# 土日の投稿で使うと実態と矛盾する「平日・勤務中前提」の表現（2026-06-27 追加）。
+# 土日の投稿で使うと実態と矛盾する「平日・勤務中前提」の表現。
 # その日が仕事中であることを前提にした語のみを挙げる。『仕事』『会社員』など
 # ブランド/属性として土日でも自然に使える語は含めない（誤検出を避ける）。
 WEEKEND_NG_PHRASES = [
@@ -253,7 +260,7 @@ DAY_OFF_DATES = {
     # "2027-01-01", "2027-01-02", "2027-01-03",
 }
 
-# 表現の言い換え（2026-08-02 ユーザー指定）。
+# 表現の言い換え。
 # 生成後に機械的に直す。プロンプトでも避けるよう指示しているが、
 # 毎回確実に揃えたい言い回しはここで最終的に上書きする。
 WORDING_FIXES = [
@@ -267,12 +274,11 @@ WORDING_FIXES = [
      r"\1も持ちませんでした"),
 ]
 
-# --- 投稿スロット（2026-07-26 追加） ---------------------------------------
+# --- 投稿スロット ---------------------------------------------------------------
 # cron-job.org が 8:00 と 12:30（JST）の2回発火する。生成側がその「どちらの枠か」を
 # 知らなかったため、本文の時間帯とその時間の私の行動が実態とズレていた
 # （例：12:30 の投稿に「今朝9時に会社に着いた」＝存在しない時刻を創作）。
 #
-# ★2026-07-26 追記：土日の「その時間の私」も実態に合わせた（ユーザー確認）。
 #
 # ★ここも書き換える場所です。
 #   投稿が出る時刻に、あなたが実際に何をしているかを書いてください。
@@ -315,7 +321,7 @@ TIME_NG_COMMON = [
     "前日に書", "昨日書いた",
 ]
 
-# 「その日の投稿を私が手で用意した」ことにする表現（2026-07-26 追加）。
+# 「その日の投稿を自分で用意した」ことにする表現。
 # ネタ出しから公開まで全自動なので、平日・土日を問わず事実に反する
 # （特に土日に『自分で投稿を考えて設定した』と書かれるのが実態と食い違う）。
 # 過去の振り返り（『昔は手で投稿していた』）は潰さないよう、
@@ -332,7 +338,7 @@ SELF_WORK_RES = [
 def is_weekend(date: datetime) -> bool:
     """私が休みの日なら True（土日、または DAY_OFF_DATES の休業日）。
 
-    2026-08-02 に祝日・夏季休暇へ対応。暦の上では平日でも出勤していない日は
+    暦の上では平日でも出勤していない日は
     土日と同じ「休日モード」で書かせる（『会議』『出社』などを禁じる）。
     """
     return date.weekday() >= 5 or date.strftime("%Y-%m-%d") in DAY_OFF_DATES
@@ -434,7 +440,7 @@ def _time_context(date: datetime, slot: str, strict: bool = False) -> str:
     """その投稿が出る時刻（8:00 / 12:30）に応じた執筆コンテキスト。
 
     生成側が枠を知らないと、時間帯の描写や「その時間の私の行動」が実態とズレる
-    （2026-07-26 修正）。曜日コンテキストと同じく、事実を渡したうえで創作を禁じる。
+    曜日コンテキストと同じく、事実を渡したうえで創作を禁じる。
     """
     s = TIME_SLOTS[slot]
     me = s["weekend" if is_weekend(date) else "weekday"]
@@ -679,11 +685,20 @@ def _normalize_tag(t: str) -> str:
 # 画像合成
 # ==========================================================================
 def cutout_background(img: Image.Image, thresh: int = 28) -> Image.Image:
-    """均一な淡ブルー背景を四隅から flood-fill して透過にする（rembg不使用）。
+    """キャラ画像の背景を四隅から flood-fill して透過にする（rembg不使用）。
 
-    キャラ画像は 1024x1024・背景が均一な淡ブルー（≈#CBE9F3）。
-    四隅を種に背景色±thresh の連結領域だけを透過にするので、
-    キャラ内部の淡い色は連結していなければ残る。
+    ★この関数が前提にしていること：
+      **背景がべた塗りの一色**であること（生成AIで作った立ち絵はたいていそうなります）。
+      四隅を種にして「背景色 ±thresh の、つながっている領域」だけを透過にするので、
+      キャラの内側にある同系色は、背景とつながっていなければ残ります。
+
+    ★thresh は書き換える場所です。
+      背景と地続きの色が抜けきらないときは少し上げ、
+      キャラの一部（目の白・歯・靴など背景色に近い部分）まで抜けてしまうときは下げます。
+      ⚠️ **上げすぎると、キャラの内側が抜けて穴になります。**
+         背景を白で確認すると気づけないので、**必ず投稿カードの背景色に重ねて確認**してください。
+      あらかじめ背景を透過したPNG（`assets/character/transparent/`）を置いておけば、
+      この処理は走りません。そちらのほうが確実です。
     """
     rgb = img.convert("RGB")
     w, h = rgb.size
@@ -799,7 +814,7 @@ def get_character(mood: str) -> Image.Image | None:
     if _has_transparency(img):
         # transparent/ の透過済み画像はそのまま使う（ハロー・隙間が綺麗に抜けている）
         return img.convert("RGBA")
-    # 原画（淡ブルー背景）の場合は実行時に切り抜く（簡易・縁連結のみ）
+    # 背景つきの原画の場合は実行時に切り抜く（簡易・縁連結のみ）
     return cutout_background(img)
 
 
@@ -812,7 +827,7 @@ def _has_transparency(img: Image.Image) -> bool:
 
 def render_image(content: dict, out_path: Path) -> None:
     W, H = CANVAS_W, CANVAS_H
-    img = gradient_background(W, H, NAVY, NAVY_DARK)
+    img = gradient_background(W, H, BASE, BASE_DARK)
     draw = ImageDraw.Draw(img)
 
     # --- キャラ（右下）。文字に被らない位置・サイズ ---
@@ -832,8 +847,8 @@ def render_image(content: dict, out_path: Path) -> None:
     hb = draw.textbbox((0, 0), BRAND_HANDLE, font=handle_font)
     hw, hh = hb[2] - hb[0], hb[3] - hb[1]
     pill = (60, 60, 60 + hw + pad_x * 2, 60 + hh + pad_y * 2)
-    draw.rounded_rectangle(pill, radius=(hh + pad_y * 2) // 2, fill=ORANGE)
-    draw.text((60 + pad_x, 60 + pad_y - hb[1]), BRAND_HANDLE, font=handle_font, fill=NAVY)
+    draw.rounded_rectangle(pill, radius=(hh + pad_y * 2) // 2, fill=ACCENT)
+    draw.text((60 + pad_x, 60 + pad_y - hb[1]), BRAND_HANDLE, font=handle_font, fill=BASE)
 
     # --- 見出し（大・太字・白、オレンジのアクセントバー付き） ---
     headline = content["headline"]
@@ -846,7 +861,7 @@ def render_image(content: dict, out_path: Path) -> None:
     line_h = 104
     draw.rounded_rectangle(
         (bar_x, y + 6, bar_x + 12, y + 6 + line_h * len(lines) - 18),
-        radius=6, fill=ORANGE,
+        radius=6, fill=ACCENT,
     )
     tx = bar_x + 34
     for ln in lines:
@@ -863,7 +878,7 @@ def render_image(content: dict, out_path: Path) -> None:
     foot_font = load_font(30, bold=True)
     foot = BRAND_MESSAGE
     fb = draw.textbbox((0, 0), foot, font=foot_font)
-    draw.text((64, H - 70 - (fb[3] - fb[1])), foot, font=foot_font, fill=ORANGE)
+    draw.text((64, H - 70 - (fb[3] - fb[1])), foot, font=foot_font, fill=ACCENT)
 
     img.convert("RGB").save(out_path, "PNG")
     print(f"🖼  画像を生成: {out_path}")

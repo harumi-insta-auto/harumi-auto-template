@@ -75,7 +75,7 @@ def main() -> None:
         "",
         "確認の目安:",
         "  - INSTAGRAM_ACCESS_TOKEN の有効期限（永続ページトークンだが念のため）",
-        "  - IMAGES_REPO_PAT の有効期限（〜2027/01/09）",
+        "  - IMAGES_REPO_PAT の有効期限（期限つきの鍵です）",
         "  - ANTHROPIC_API_KEY の残高・レート",
         "  - Graph API の仕様変更（v21.0 廃止など）",
     ]
