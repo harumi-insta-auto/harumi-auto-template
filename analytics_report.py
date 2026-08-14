@@ -545,10 +545,13 @@ def build_insight_section(summary: dict) -> str:
     try:
         msg = client.messages.create(
             model="claude-sonnet-5",
-            max_tokens=1500,
+            # 思考＋出力の合計上限。思考が既定でONのモデルでは余裕を持たせる
+            max_tokens=8000,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = msg.content[0].text.strip()
+        # ⚠️ content[0] を決め打ちしない。思考が既定でONのモデルでは
+        # 先頭に ThinkingBlock（.text を持たない）が入るため。
+        text = next(b.text for b in msg.content if getattr(b, "type", None) == "text").strip()
         return text + "\n"
     except Exception as e:  # noqa: BLE001
         return f"## 所見と改善提案\n\n> Claude 生成に失敗: {e}\n"

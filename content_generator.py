@@ -403,14 +403,30 @@ def claude_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-def claude_json(client, prompt, max_tokens=1500):
+def _first_text(msg) -> str:
+    """レスポンスから最初のテキストブロックを取り出す。
+
+    ⚠️ content[0] を決め打ちしないこと。claude-sonnet-5 は思考が既定でONで、
+    レスポンスの先頭に ThinkingBlock（.text を持たない）が入る。決め打ちすると
+    AttributeError になり、フォールバックのネタで静かに投稿され続ける
+    （ワークフローは緑のまま・エラー通知も飛ばない）。
+    """
+    for block in msg.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    raise ValueError(f"テキストブロックが無い: {[getattr(b, 'type', '?') for b in msg.content]}")
+
+
+# max_tokens は「思考＋出力」の合計上限。思考が既定でONのモデルでは、
+# 小さすぎると JSON が途中で切れて json.loads に失敗する。→ 余裕を持たせる
+def claude_json(client, prompt, max_tokens=8000):
     msg = client.messages.create(
         model="claude-sonnet-5",
         max_tokens=max_tokens,
         system=PERSONA,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = msg.content[0].text.strip()
+    raw = _first_text(msg).strip()
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
     return json.loads(raw)
 
