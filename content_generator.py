@@ -241,10 +241,30 @@ NG_PHRASES = []
 # 土日の投稿で使うと実態と矛盾する「平日・勤務中前提」の表現。
 # その日が仕事中であることを前提にした語のみを挙げる。『仕事』『会社員』など
 # ブランド/属性として土日でも自然に使える語は含めない（誤検出を避ける）。
-WEEKEND_NG_PHRASES = [
-    "会議", "勤務", "出社", "退勤", "残業", "通勤",
-    "平日", "業務中", "仕事中", "会社で働", "会社にい", "オフィスで",
+# ★違反は「重い」「軽い」の二層に分けています。理由は、ガードが厳しすぎると
+#   AIが書いた文章が丸ごと予備の文章（フォールバック）に差し替わってしまうからです。
+#   たとえば「平日は時間がないので、休みの日にまとめてやります」は、土曜に書いても
+#   事実として正しい“対比”です。ところが「平日」という語があるだけで弾いていると、
+#   これが毎回フォールバックに落ち、しかもAIの呼び出し回数が倍になります。
+#   → 「今日は平日だ」と断定する形だけを弾き、対比は通す。
+
+# 重い違反：その日の事実と食い違う。再生成しても直らなければフォールバックに落とす。
+WEEKEND_NG_HEAVY = [
+    "出社", "退勤", "通勤", "業務中", "仕事中", "会社で働", "会社にい", "オフィスで",
+    # 休みの「理由」を特定する語。DAY_OFF_DATES は祝日・お盆・有給を区別せずに
+    # 持っているので、理由を書かせると実際とは違う日に「今日は祝日で」と出ます。
+    "祝日", "お盆", "有給",
 ]
+
+# 「今日は平日だ」と断定する言い回しだけを弾く。対比の「平日は〜」「平日の朝は〜」は通す。
+WEEKEND_NG_HEAVY_RES = [
+    re.compile(r"(?:今日|きょう|本日)(?:は|も|が)平日"),
+    re.compile(r"平日(?:の|である)(?:今日|本日)"),
+]
+
+# 軽い違反：対比としてなら休日でも正当に使える語。再生成は促すが、残っていても
+# フォールバックには落とさない（平板な予備の文章を出すほうが害が大きいため）。
+WEEKEND_NG_LIGHT = ["会議", "勤務", "残業"]
 
 JP_WEEKDAYS = ["月", "火", "水", "木", "金", "土", "日"]
 
@@ -441,8 +461,10 @@ def _day_context(date: datetime, strict: bool = False) -> str:
     if is_extra_day_off(date):
         # 暦は平日でも会社が休みの日（祝日・お盆・夏季休暇）。
         # 曜日名だけ渡すと「平日だから出社している」と書かれてしまうので明示する。
-        head = (f"今日は{wd}曜日ですが、会社が休み（祝日・お盆などの休暇）で、"
-                "私は出勤していません。\n")
+        # ⚠️ 休みの理由（祝日・お盆など）は書かない。候補を並べるとモデルがそこから
+        # 1つ選んで「今日は祝日で」と書いてしまい、実際は祝日でない日に嘘が出る。
+        head = (f"今日は{wd}曜日ですが、会社が休みで、私は出勤していません。\n"
+                "※休みの理由（祝日・お盆・有給など）は特定できないので書かないこと。\n")
     else:
         head = f"今日は{wd}曜日（休日）です。\n"
     base = (
@@ -450,6 +472,8 @@ def _day_context(date: datetime, strict: bool = False) -> str:
         "【重要・厳守】今日は休みの日です。次の表現は実態と矛盾するので絶対に使わないでください：\n"
         "　『会議』『勤務中』『勤務時間』『出社』『退勤』『残業』『通勤』『平日』『業務中』『仕事中』など、\n"
         "　その日が平日・仕事中であることを前提にした言い回し全般。\n"
+        "　あわせて『祝日』『お盆』『有給』など、休みの理由を特定する語も使わないこと"
+        "（実際と違う理由を書いてしまうため）。『休みの日』『今日は休み』と書けばよい。\n"
         "今日の角度：休日で自分は仕事をしていない／何もしていないのに、"
         "仕組みが曜日に関係なく今日もこの投稿を出している、というリアルさを書く。\n"
     )
@@ -527,25 +551,36 @@ def build_prompt(pillar_key: str, date: datetime, slot: str = "A",
     """)
 
 
-def _fallback_content(pillar_key: str, weekend: bool = False) -> dict:
+def _fallback_content(pillar_key: str, weekend: bool = False,
+                      slot: str | None = None) -> dict:
     """ANTHROPIC_API_KEY 不在やパース失敗時の最低限のネタ（柱ごと）。
 
     weekend=True のときは平日・勤務前提の語を含まない休日版を返す。
+    slot（"A"/"B"）を渡すと、その枠ぶんの文章を返す。
 
     ★ここも書き換える場所です。
       ここは「予備の文章」（フォールバック）です。AIの生成に失敗した日でも
       投稿を止めないために、あらかじめ用意しておく文章です（第4章）。
-      柱ごと・平日/休日ごとに1本ずつ、当たりさわりのない文章を書いておいてください。
+      柱ごと・平日/休日ごと・**枠ごと**に1本ずつ、当たりさわりのない文章を
+      書いておいてください。
       ⚠️ 平日版に『会議』『出社』などを書くと、休日に使い回されたとき実態と矛盾します。
          必ず平日版と休日版を別々に書いてください。
       ⚠️ NG_PHRASES に入れた語をここに書かないこと（品質チェックで置換され、文が壊れます）。
+      ⚠️ **枠ごとに必ず違う文章にしてください。** 柱は日付で決まるので、同じ日に
+         2つの枠が両方ともここに落ちると、見出しも本文も完全に同じになります。
+         見出しから画像を描いているので画像まで1バイトも変わらず、
+         「同じ写真と同じ文章を1日2回投稿する」ことになります。
+         （さらに、画像を置くリポジトリへの git commit が「差分なし」で失敗し、
+         ワークフローごと落ちます。第8章のトラブルシュートを参照。）
     """
     pillar = PILLARS.get(pillar_key, PILLARS["A"])
     when = "休みの日ですが" if weekend else "私は自分では手を動かしていませんが"
+    # 枠が分かるときは、その時刻を文章に織り込んで枠ごとに別の文章にする。
+    at = f"{TIME_SLOTS[slot]['label']}の" if slot in TIME_SLOTS else ""
     return {
-        "headline": f"（{pillar['name']}の予備の見出し）",
+        "headline": f"（{pillar['name']}の{at}予備の見出し）",
         "caption": (
-            f"（{pillar['name']}の予備の本文をここに書いておきます。{when}、"
+            f"（{pillar['name']}の{at}予備の本文をここに書いておきます。{when}、"
             "この投稿は仕組みが自動で出しています。"
             "AIの生成に失敗した日に、この文章が代わりに使われます。）\n\n"
             "（最後にフォローや保存への一言を添えておくとよいです。）"
@@ -592,10 +627,23 @@ def _normalize_content(data: dict, pillar_key: str, weekend: bool) -> dict:
     }
 
 
-def _weekend_violation(content: dict) -> str | None:
-    """土日投稿に平日・勤務前提の語が混入していれば、その最初の語を返す。"""
+def _weekend_violation(content: dict) -> tuple[str, str] | None:
+    """土日投稿に平日・勤務前提の語があれば (重さ, 検出語) を返す。
+
+    重さ＝"heavy"（その日の事実と食い違う）／"light"（対比としてなら正当）。
+    """
     text = f"{content['headline']}\n{content['caption']}"
-    return next((ng for ng in WEEKEND_NG_PHRASES if ng in text), None)
+    hit = next((ng for ng in WEEKEND_NG_HEAVY if ng in text), None)
+    if hit:
+        return ("heavy", hit)
+    for rx in WEEKEND_NG_HEAVY_RES:
+        m = rx.search(text)
+        if m:
+            return ("heavy", m.group(0))
+    hit = next((ng for ng in WEEKEND_NG_LIGHT if ng in text), None)
+    if hit:
+        return ("light", hit)
+    return None
 
 
 def _time_violation(content: dict, slot: str) -> str | None:
@@ -615,15 +663,19 @@ def _time_violation(content: dict, slot: str) -> str | None:
     return None
 
 
-def _find_violation(content: dict, weekend: bool, slot: str) -> tuple[str, str] | None:
-    """土日ガードと時間帯ガードをまとめて評価し、(種別, 検出語) を返す。"""
+def _find_violation(content: dict, weekend: bool, slot: str) -> tuple[str, str, str] | None:
+    """土日ガードと時間帯ガードをまとめて評価し、(種別, 検出語, 重さ) を返す。
+
+    時間帯の違反は「存在しない時刻を書いた」等の事実誤りなので常に heavy。
+    """
     if weekend:
-        hit = _weekend_violation(content)
-        if hit:
-            return ("土日", hit)
+        found = _weekend_violation(content)
+        if found:
+            severity, hit = found
+            return ("土日", hit, severity)
     hit = _time_violation(content, slot)
     if hit:
-        return ("時間帯", hit)
+        return ("時間帯", hit, "heavy")
     return None
 
 
@@ -632,7 +684,8 @@ def generate_content(pillar_key: str, date: datetime, slot: str = "A") -> dict:
     client = claude_client()
 
     if client is None:
-        content = _normalize_content(_fallback_content(pillar_key, weekend), pillar_key, weekend)
+        content = _normalize_content(
+            _fallback_content(pillar_key, weekend, slot), pillar_key, weekend)
         print(f"📝 フォールバックのネタを使用（柱{pillar_key}{'・休日版' if weekend else ''}）")
         return content
 
@@ -641,16 +694,22 @@ def generate_content(pillar_key: str, date: datetime, slot: str = "A") -> dict:
         print(f"📝 Claude がネタを生成（柱{pillar_key}・{TIME_SLOTS[slot]['label']}枠）")
     except Exception as e:
         print(f"⚠️  Claude 生成に失敗 → フォールバック: {type(e).__name__}: {e}")
-        return _normalize_content(_fallback_content(pillar_key, weekend), pillar_key, weekend)
+        return _normalize_content(
+            _fallback_content(pillar_key, weekend, slot), pillar_key, weekend)
 
     content = _normalize_content(data, pillar_key, weekend)
 
     # ガード：土日に平日・勤務前提の語、またはその枠の時間帯と矛盾する表現が
-    # 混入していたら一度だけ厳しめに再生成し、それでも残るならフォールバックに差し替える。
+    # 混入していたら一度だけ厳しめに再生成する。
+    # ★そのあとの扱いは「違反の重さ」で分けています。フォールバックに落とすのは
+    #   重い違反が残ったときだけです。軽い違反（対比としてなら正当な語）で
+    #   予備の文章に落としてしまうと、AIが書いた文章より確実に平板になるうえ、
+    #   同じ日の2つの枠が同じ文章になってしまうことがあります。
     found = _find_violation(content, weekend, slot)
     if found:
-        kind, hit = found
-        print(f"⚠️  {kind}チェック: 実態と矛盾する表現「{hit}」を検出 → 再生成します")
+        kind, hit, severity = found
+        why = "実態と矛盾する" if severity == "heavy" else "対比なら正当だが紛らわしい"
+        print(f"⚠️  {kind}チェック: {why}表現「{hit}」を検出 → 再生成します")
         try:
             data2 = claude_json(client, build_prompt(
                 pillar_key, date, slot, strict_weekend=True, strict_time=True))
@@ -658,13 +717,21 @@ def generate_content(pillar_key: str, date: datetime, slot: str = "A") -> dict:
         except Exception as e:
             print(f"⚠️  再生成に失敗: {type(e).__name__}: {e}")
             content2 = None
-        if content2 is not None and _find_violation(content2, weekend, slot) is None:
-            print("   → 再生成で解消")
-            content = content2
+
+        if content2 is None:
+            still = found          # 再生成できなかった＝初回の判定のまま
         else:
-            still = content2 and _find_violation(content2, weekend, slot)
-            print(f"   → 再生成でも残存（{still}）→ フォールバックに差し替え")
-            content = _normalize_content(_fallback_content(pillar_key, weekend), pillar_key, weekend)
+            content = content2
+            still = _find_violation(content2, weekend, slot)
+
+        if still is None:
+            print("   → 再生成で解消")
+        elif still[2] == "light":
+            print(f"   → 再生成後も「{still[1]}」が残るが、対比表現として許容し採用する")
+        else:
+            print(f"   → 再生成でも重い違反が残存（{still[0]}／{still[1]}）→ フォールバックに差し替え")
+            content = _normalize_content(
+                _fallback_content(pillar_key, weekend, slot), pillar_key, weekend)
 
     return content
 

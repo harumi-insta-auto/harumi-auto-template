@@ -98,7 +98,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/outputs/post.jpg" post.jpg
           cp "$GITHUB_WORKSPACE/outputs/caption.txt" caption.txt
           git add post.jpg caption.txt
-          git commit -m "post image $(date -u +%Y%m%d-%H%M%S)"
+          # --allow-empty＝画像とキャプションが前回と1バイトも変わらなくても、必ず
+          # コミットを1つ作ります。差分がゼロだと git commit は終了コード1を返し、
+          # set -e が効いてジョブごと落ちてしまうためです（投稿は出せているのに
+          # ワークフローが赤くなる）。新しいコミットが要るのは、下の image_url が
+          # コミットで固定した raw URL だからで、空のコミットでも支障はありません。
+          git commit --allow-empty -m "post image $(date -u +%Y%m%d-%H%M%S)"
           git push origin main
 
           COMMIT=$(git rev-parse HEAD)
