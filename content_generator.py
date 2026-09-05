@@ -38,6 +38,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from episodes import EPISODE_KEYS, episodes_prompt_block
+
 ROOT = Path(__file__).parent
 OUT_DIR = ROOT / "outputs"
 OUT_DIR.mkdir(exist_ok=True)
@@ -363,6 +365,45 @@ SELF_WORK_RES = [
     re.compile(r"予約投稿"),
 ]
 
+# --- 創作ガード（起きていない出来事を書かせない） ---------------------------------
+# プロンプト側（_facts_context）で「一覧にあるものだけ」と縛っても、それだけでは
+# 同じことが起きたときに**静かに通ってしまいます**。エラーは出ず、ワークフローは
+# 成功のまま終わるからです。ここは最後の砦で、過去形の目印と不具合の語が
+# ひとつの文に並んでいたら「作った話」の疑いとして拾い、一度だけ再生成させます。
+#
+# episodes.EPISODE_KEYS（実在の出来事を指す語）が同じ文にあれば通します。
+# 一覧から選んで書いた場合まで弾くと、書ける具体が何も残らなくなるためです。
+# （一覧が空のうちは EPISODE_KEYS も空＝除外なし。まだ実在の出来事が1つも無いので、
+#   過去形＋不具合語の文はすべて疑ってよい、という意味になります。）
+FACT_PAST_MARKERS = [
+    "昨日", "一昨日", "先週", "先月", "この前", "先日", "前回", "以前",
+    "数日前", "何日か前", "少し前", "つい最近", "先ほど",
+    "最初", "当初", "はじめのころ", "初めのころ", "組んだとき", "組んだ時",
+    "動かしたとき", "動かした時", "作った直後", "始めたころ", "始めた頃",
+]
+FACT_PAST_RES = [
+    re.compile(r"\d+\s*(?:日|週間|か月|ヶ月)前"),
+    re.compile(r"\d+\s*(?:日|週間|か月|ヶ月)(?:くらい|ほど|も)?(?:気づ|悩)"),
+    # 「投稿が止まったことがあります」＝目印の語を持たない体験談の形。
+    re.compile(r"こと(?:が|も)あ(?:り|る|っ)"),
+]
+# 「システムに何か起きた」ことを指す語。心境や一般論だけの文は拾いません。
+# 部分一致なので、別の意味を巻き込む語は入れないでください
+# （「落ち」＝落ち着く／落ち込む、「直し」＝見直し が引っかかりました）。
+FACT_TROUBLE_WORDS = [
+    "バグ", "エラー", "不具合", "止まっ", "止まり", "動かな", "失敗し",
+    "ミス", "間違え", "間違っ", "ずれて", "ずれた", "ズレて", "ズレた",
+    "おかしく", "壊れ", "文字化け", "飛びまし", "飛んだ",
+]
+# 「勝手に直った」と書かせないための語。
+# **この仕組みに、止まったあと自動で復旧する機能はありません**（直すのは人です）。
+# 「止まっても自動で戻る」と書かれると、読む人に無い機能を約束することになります。
+# ※「自動投稿」「自動で出す」は通常運転なので巻き込みません（「自動で」＋回復の語のみ）。
+SELF_HEAL_AUTO_WORDS = ["自動で", "勝手に", "ひとりでに", "自然に", "放っておいたら"]
+SELF_HEAL_RECOVER_WORDS = ["復旧", "復帰", "直っ", "直り", "元に戻", "立ち直"]
+# 文の区切り（。！？と改行）。
+SENTENCE_SPLIT_RE = re.compile(r"[。！？\n]+")
+
 
 def is_weekend(date: datetime) -> bool:
     """私が休みの日なら True（土日、または DAY_OFF_DATES の休業日）。
@@ -528,13 +569,65 @@ def _time_context(date: datetime, slot: str, strict: bool = False) -> str:
     return base
 
 
+def _facts_context(strict: bool = False) -> str:
+    """過去の出来事を創作させないためのコンテキスト。
+
+    曜日・時間帯のコンテキストと同じ考え方＝**事実を渡したうえで創作を禁じる**。
+    禁じるだけだと「具体を入れろ」という指示とぶつかって、AIはそれらしい話を
+    作るほうへ倒れます。書いてよい具体を先に渡すのが要点です（episodes.py）。
+    """
+    base = (
+        "【最重要・事実の厳守】この投稿は実在の仕組みの記録です。"
+        "起きていない出来事を書かないでください。\n"
+        "　・裏づけのない出来事・日付・期間・数値を作らないでください"
+        "（『先週こんなバグが』『1週間気づかなかった』『数値が1桁違っていた』など）。\n"
+        "　・弱さや戸惑いは正直に書いてよいですが、それは"
+        "『起きていない不具合を書いてよい』という意味ではありません。\n"
+        "　・extra_hashtags も同じです。本文に書いていない出来事を指すタグ"
+        "（例：#バグとの戦い）を付けないでください。\n"
+        "　・この仕組みには、止まったあと自動で復旧する機能はありません。"
+        "『放っておいたら直った』のようには書かないでください。\n"
+    )
+
+    block = episodes_prompt_block()
+    if block:
+        base += (
+            "　・システムに起きた出来事（不具合・エラー・修正・気づき）に触れてよいのは、"
+            "下の【実際に起きたこと】にあるものだけです。\n"
+            "　・具体を入れたいときは、次のどれかにしてください。"
+            "①下の一覧から1つ選ぶ ②いま動いている仕組みの説明 ③今の時間帯の私の様子。\n"
+            "　・過去の出来事に触れないほうが自然なら、触れなくてかまいません。"
+            "無理に失敗談を入れる必要はありません。\n"
+            "【実際に起きたこと（過去に触れるならここから）】\n"
+        )
+        base += block
+    else:
+        # episodes.py がまだ雛形のまま＝渡せる過去がひとつも無い状態。
+        # 「一覧から選べ」と言いながら一覧を出さないのがいちばん危ないので、
+        # そのときは「過去には触れない」と言い切ります。
+        base += (
+            "　・過去に起きた出来事には、いっさい触れないでください。"
+            "いま動いている仕組みの説明と、今の時間帯の私の様子だけで書いてください。\n"
+            "　・無理に失敗談やエピソードを入れる必要はありません。\n"
+        )
+
+    if strict:
+        base += (
+            "【再厳守】前回の生成で、実際には起きていない出来事が本文に混入しました。"
+            "今回は過去の出来事に触れず、いま動いている仕組みと今の時間帯の私の様子だけで"
+            "書いてください。\n"
+        )
+    return base
+
+
 def build_prompt(pillar_key: str, date: datetime, slot: str = "A",
-                 strict_weekend: bool = False, strict_time: bool = False) -> str:
+                 strict_weekend: bool = False, strict_time: bool = False,
+                 strict_facts: bool = False) -> str:
     p = PILLARS[pillar_key]
     moods = "／".join(MOODS.keys())
     return textwrap.dedent(f"""\
         今日の Instagram フィード投稿を1本作ってください。
-        {_day_context(date, strict=strict_weekend)}{_time_context(date, slot, strict=strict_time)}今日の「柱」は【柱{pillar_key}：{p['name']}】です。
+        {_day_context(date, strict=strict_weekend)}{_time_context(date, slot, strict=strict_time)}{_facts_context(strict=strict_facts)}今日の「柱」は【柱{pillar_key}：{p['name']}】です。
         この柱の内容：{p['desc']}
 
         次の JSON だけを出力してください（前後に説明文やコードフェンスを付けない）:
@@ -663,10 +756,62 @@ def _time_violation(content: dict, slot: str) -> str | None:
     return None
 
 
+def _fabrication_violation(content: dict) -> str | None:
+    """実際には起きていない出来事を書いた疑いがあれば、その文の一部を返す。
+
+    判定＝ひとつの文の中に「過去の目印」と「不具合の語」が並んでいること。
+    ただし `EPISODE_KEYS`（実在の出来事を指す語）が同じ文にあれば通します
+    ＝一覧から選んで書いた場合まで弾くと、書ける具体が何も残らないためです。
+
+    ★これは網ではなく最後の砦です。本命はプロンプト側（_facts_context）で、
+      ここは同じ形の創作が**静かに通る**のを防ぐためのものです。
+    """
+    text = f"{content['headline']}\n{content['caption']}"
+    for sentence in SENTENCE_SPLIT_RE.split(text):
+        if not sentence.strip():
+            continue
+        if any(k in sentence for k in EPISODE_KEYS):
+            continue                       # 実在の出来事の話とみなす
+        marker = next((m for m in FACT_PAST_MARKERS if m in sentence), None)
+        if marker is None:
+            for rx in FACT_PAST_RES:
+                m = rx.search(sentence)
+                if m:
+                    marker = m.group(0)
+                    break
+        if marker is None:
+            continue
+        trouble = next((w for w in FACT_TROUBLE_WORDS if w in sentence), None)
+        if trouble:
+            return f"{marker}…{trouble}"
+    return None
+
+
+def _self_heal_violation(content: dict) -> str | None:
+    """「止まっても自動で復旧する」と書いた疑いがあれば、その語の組を返す。
+
+    そんな仕組みはありません（止まったときに直しているのは人です）。
+    実在の出来事を指す語があっても通しません
+    ＝ EPISODE_KEYS による除外は、ここでは行いません。
+    """
+    text = f"{content['headline']}\n{content['caption']}"
+    for sentence in SENTENCE_SPLIT_RE.split(text):
+        if not sentence.strip():
+            continue
+        auto = next((w for w in SELF_HEAL_AUTO_WORDS if w in sentence), None)
+        if auto is None:
+            continue
+        rec = next((w for w in SELF_HEAL_RECOVER_WORDS if w in sentence), None)
+        if rec:
+            return f"{auto}…{rec}"
+    return None
+
+
 def _find_violation(content: dict, weekend: bool, slot: str) -> tuple[str, str, str] | None:
-    """土日ガードと時間帯ガードをまとめて評価し、(種別, 検出語, 重さ) を返す。
+    """土日ガード・時間帯ガード・創作ガードをまとめて評価し、(種別, 検出語, 重さ) を返す。
 
     時間帯の違反は「存在しない時刻を書いた」等の事実誤りなので常に heavy。
+    創作（起きていない出来事）も同じ理由で常に heavy。
     """
     if weekend:
         found = _weekend_violation(content)
@@ -676,6 +821,12 @@ def _find_violation(content: dict, weekend: bool, slot: str) -> tuple[str, str, 
     hit = _time_violation(content, slot)
     if hit:
         return ("時間帯", hit, "heavy")
+    hit = _fabrication_violation(content)
+    if hit:
+        return ("事実", hit, "heavy")
+    hit = _self_heal_violation(content)
+    if hit:
+        return ("事実", hit, "heavy")
     return None
 
 
@@ -708,11 +859,14 @@ def generate_content(pillar_key: str, date: datetime, slot: str = "A") -> dict:
     found = _find_violation(content, weekend, slot)
     if found:
         kind, hit, severity = found
-        why = "実態と矛盾する" if severity == "heavy" else "対比なら正当だが紛らわしい"
+        why = ("起きていない出来事を書いた疑いのある" if kind == "事実"
+               else "実態と矛盾する" if severity == "heavy"
+               else "対比なら正当だが紛らわしい")
         print(f"⚠️  {kind}チェック: {why}表現「{hit}」を検出 → 再生成します")
         try:
             data2 = claude_json(client, build_prompt(
-                pillar_key, date, slot, strict_weekend=True, strict_time=True))
+                pillar_key, date, slot, strict_weekend=True, strict_time=True,
+                strict_facts=(kind == "事実")))
             content2 = _normalize_content(data2, pillar_key, weekend)
         except Exception as e:
             print(f"⚠️  再生成に失敗: {type(e).__name__}: {e}")
