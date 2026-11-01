@@ -32,6 +32,7 @@ GitHub Actionsのワークフロー2本でできています。
 ├── analytics_report.py         … 数字をレポートにまとめる（第7章）
 ├── email_report.py             … レポートをメールで送る（第7章）
 ├── validation/validate.py      … 4つの疎通テストをまとめて実行する（第3章）
+├── tests/                      … 文章の整え方のテスト（API を使わない）
 └── requirements.txt            … 必要な部品の一覧
 ```
 
@@ -58,6 +59,22 @@ GitHub Actionsのワークフロー2本でできています。
 | `ALLOWED_HOURS` / `LIFE_HOURS_NOTE` | 文章に出してよい時刻 |
 | `REAL_EPISODES`（`episodes.py`） | **実際に起きたことの一覧**。ここに無い過去の出来事は書かせない |
 | `_fallback_content()` | 予備の文章（AIの生成が失敗した日に使われる） |
+
+### 📐 文章と見出しの整え方
+
+投稿の文章と画像の見出しは、AIが書いたあとに**機械で整えます**。入れるのは改行だけで、文字は変えません。
+
+- **キャプション**：1文ごとに段落を分け、読点のあとで改行して、1行を短くする
+- **見出し**：数字と助数詞、カタカナ語の途中では折らない
+- **年の取り違え**：AIに今日の日付を渡し、仕組みの話に実際の出来事が無い「去年」「◯年前」が出たら書き直させる
+
+`content_generator.py` を直したら、次の3つを実行してください（どれも API を使いません）。
+
+```bash
+python tests/test_wrap_caption.py
+python tests/test_wrap_headline.py
+python tests/test_year_guard.py
+```
 
 ### 📝 `episodes.py` ── AIに、渡していない過去を書かせないために
 

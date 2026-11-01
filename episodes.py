@@ -39,6 +39,8 @@
 """
 from __future__ import annotations
 
+from datetime import date
+
 # 実際に起きたこと。投稿文で過去の出来事に触れるときは、ここから1つだけ選ばせる。
 #
 # ↓ 2件は「書き方の例」です。日付を実際の日付に変えると、その項目が有効になります。
@@ -85,12 +87,44 @@ def real_episodes() -> list[dict]:
 EPISODE_KEYS: list[str] = [k for e in real_episodes() for k in e["keys"]]
 
 
-def episodes_prompt_block() -> str:
-    """プロンプトに差し込む【実際に起きたこと】の一覧。空なら空文字を返す。"""
+def relative_year_label(when: str, today: date) -> str:
+    """'2026-06-19' を今日から見た言い方（今年の6月／去年の6月／2025年6月）にする。
+
+    ★AIは、今日が何年かを知りません。日付だけ渡すと、年を推測して
+      今年の出来事を「去年」と書くことがあります。言い方まで渡しておきます。
+    """
+    d = date.fromisoformat(when)
+    if d.year == today.year:
+        return f"今年の{d.month}月"
+    if d.year == today.year - 1:
+        return f"去年の{d.month}月"
+    return f"{d.year}年{d.month}月"
+
+
+def episodes_prompt_block(today: date | None = None) -> str:
+    """プロンプトに差し込む【実際に起きたこと】の一覧。空なら空文字を返す。
+
+    today を渡すと、日付のあとに今日から見た言い方（今年の6月 など）を添える。
+    """
     episodes = real_episodes()
     if not episodes:
         return ""
-    return "\n".join(f"　・{e['when']}：{e['what']}" for e in episodes) + "\n"
+
+    def when(e: dict) -> str:
+        if today is None:
+            return e["when"]
+        return f"{e['when']}（{relative_year_label(e['when'], today)}）"
+
+    return "\n".join(f"　・{when(e)}：{e['what']}" for e in episodes) + "\n"
+
+
+def episode_years() -> set[int]:
+    """実際の出来事がある年の集合（『去年』と書いてよいかの判定に使う）。
+
+    雛形の項目は "YYYY-MM-DD" のままで日付として読めないので、
+    real_episodes() から取ります。
+    """
+    return {date.fromisoformat(e["when"]).year for e in real_episodes()}
 
 
 def render_markdown() -> str:

@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import textwrap
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,7 +39,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from episodes import EPISODE_KEYS, episodes_prompt_block
+from episodes import EPISODE_KEYS, episode_years, episodes_prompt_block
 
 ROOT = Path(__file__).parent
 OUT_DIR = ROOT / "outputs"
@@ -404,6 +405,21 @@ SELF_HEAL_RECOVER_WORDS = ["復旧", "復帰", "直っ", "直り", "元に戻", 
 # 文の区切り（。！？と改行）。
 SENTENCE_SPLIT_RE = re.compile(r"[。！？\n]+")
 
+# --- 年の取り違えガード -----------------------------------------------------
+# プロンプトに曜日を渡していても、今日が何年かを渡していないと、AIは年を推測します。
+# 今年の出来事を「去年」と書いても、エラーは出ません。対策は2つです。
+#   ①プロンプトに今日の日付と「今年の6月」のような言い方を渡す（_facts_context）
+#   ②仕組みの話の文に「去年」「◯年前」が出たら、その年に実際の出来事が無いかぎり弾く
+# ※「去年の自分とは全然違う」のような、仕組みに触れない心境の文は拾いません。
+YEAR_PAST_RE = re.compile(
+    r"(一昨年|おととし|去年|昨年|前年|([0-9０-９]+|[一二三四五六七八九十])\s*年(?:以上)?(?:も)?前)")
+YEAR_SYSTEM_WORDS = [
+    "稼働", "仕組み", "自動", "投稿", "本番", "作っ", "作り", "組ん", "組み",
+    "動かし", "動き始め", "始め", "運用", "システム", "コード", "AI",
+]
+_KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                 "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+
 
 def is_weekend(date: datetime) -> bool:
     """私が休みの日なら True（土日、または DAY_OFF_DATES の休業日）。
@@ -569,7 +585,7 @@ def _time_context(date: datetime, slot: str, strict: bool = False) -> str:
     return base
 
 
-def _facts_context(strict: bool = False) -> str:
+def _facts_context(date: datetime | None = None, strict: bool = False) -> str:
     """過去の出来事を創作させないためのコンテキスト。
 
     曜日・時間帯のコンテキストと同じ考え方＝**事実を渡したうえで創作を禁じる**。
@@ -589,7 +605,13 @@ def _facts_context(strict: bool = False) -> str:
         "『放っておいたら直った』のようには書かないでください。\n"
     )
 
-    block = episodes_prompt_block()
+    if date is not None:
+        base += (
+            f"　・今日は {date.year}年{date.month}月{date.day}日 です。年を推測しないでください。"
+            "裏づけのない年について『去年』『昨年』『◯年前』とは書かないでください。\n"
+        )
+
+    block = episodes_prompt_block(date.date() if date is not None else None)
     if block:
         base += (
             "　・システムに起きた出来事（不具合・エラー・修正・気づき）に触れてよいのは、"
@@ -601,6 +623,8 @@ def _facts_context(strict: bool = False) -> str:
             "【実際に起きたこと（過去に触れるならここから）】\n"
         )
         base += block
+        if date is not None:
+            base += "　※一覧の出来事を書くときは、かっこの中の言い方（今年の6月 など）に合わせてください。\n"
     else:
         # episodes.py がまだ雛形のまま＝渡せる過去がひとつも無い状態。
         # 「一覧から選べ」と言いながら一覧を出さないのがいちばん危ないので、
@@ -627,7 +651,7 @@ def build_prompt(pillar_key: str, date: datetime, slot: str = "A",
     moods = "／".join(MOODS.keys())
     return textwrap.dedent(f"""\
         今日の Instagram フィード投稿を1本作ってください。
-        {_day_context(date, strict=strict_weekend)}{_time_context(date, slot, strict=strict_time)}{_facts_context(strict=strict_facts)}今日の「柱」は【柱{pillar_key}：{p['name']}】です。
+        {_day_context(date, strict=strict_weekend)}{_time_context(date, slot, strict=strict_time)}{_facts_context(date, strict=strict_facts)}今日の「柱」は【柱{pillar_key}：{p['name']}】です。
         この柱の内容：{p['desc']}
 
         次の JSON だけを出力してください（前後に説明文やコードフェンスを付けない）:
@@ -682,6 +706,387 @@ def _fallback_content(pillar_key: str, weekend: bool = False,
         "extra_hashtags": [],
     }
 
+# 1段落あたりの目安字数。この前後で意味の切れ目を探して段落を割ります。
+PARAGRAPH_TARGET_CHARS = 70
+
+# 文の終わりの判定。閉じ括弧は文末側に含める（「〜でした。」）。
+# 「…」は文末記号にしない（『書いている…わけではなく』のように途中で使うため）。
+_SENTENCE_RE = re.compile(r"[^。！？!?\n]*[。！？!?]+[」』）\)]*|[^。！？!?\n]+")
+
+
+def _ensure_paragraphs(caption: str) -> str:
+    """本文に段落（空行）が無ければ、文の切れ目で段落に割り直す。
+
+    ★なぜ必要か：段落の分け方はモデルによって変わります。モデルを切り替えただけで、
+      改行のない一続きの文章が返ってくることがあります。ここで最終的に段落を
+      保証します。**文字は一切書き換えません**（言い回しの決めごとや
+      時間帯の表現を壊さないため、入れるのは改行だけです）。
+    """
+    text = caption.strip()
+    if not text:
+        return text
+    # 3行以上の空行は1つの空行に詰める
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if "\n\n" in text:
+        return text
+    if "\n" in text:
+        # 改行はあるが空行が無い＝段落の意図はあるので、空行に格上げするだけ
+        return "\n\n".join(s.strip() for s in text.split("\n") if s.strip())
+
+    sentences = [m.group(0).strip() for m in _SENTENCE_RE.finditer(text)]
+    sentences = [s for s in sentences if s]
+    if len(sentences) < 3:
+        return text  # 2文以下は割らない
+
+    # 最後の1文は CTA（フォロー/保存の促し）なので独立した段落にする
+    body, cta = sentences[:-1], sentences[-1]
+    total = sum(len(s) for s in body)
+    # 本文パートを 1〜6 段落に。CTA と合わせて 2〜7 段落になる
+    n = min(6, len(body), max(1, round(total / PARAGRAPH_TARGET_CHARS)))
+    target = total / n
+
+    paragraphs, cur = [], ""
+    for i, s in enumerate(body):
+        cur += s
+        rest = len(body) - i - 1            # この文より後に残っている文数
+        need = n - len(paragraphs) - 1      # cur を確定したあと、まだ作る段落数
+        # 目安の長さに達したら区切る。残り文数がちょうど残り段落数になったら、
+        # 空段落を作らないためにここで必ず区切る。
+        if need > 0 and (len(cur) >= target or rest <= need):
+            paragraphs.append(cur)
+            cur = ""
+    if cur:
+        paragraphs.append(cur)
+    paragraphs.append(cta)
+
+    print(f"📐 本文に段落が無かったので {len(paragraphs)} 段落に割り直しました")
+    return "\n\n".join(paragraphs)
+
+
+# ── キャプションの折り返し ───────────────────────────────────────────────
+#
+# ★なぜ機械で折るのか
+#   モデルは字数を数えられません。「1行20字以内で」と頼んでも守られないので、
+#   「文章はモデル／改行は機械」に分けます。
+#
+# ★幅の根拠
+#   スマホのキャプションで1行に収まる目安が20字です。
+#   ⚠️ 文字数ではなく全角換算の幅で数えます（半角は 0.5）。
+#
+# ★ここも変えてかまいません（下の値は書き換える場所ではなく、調整できる場所です）。
+#   長い行が好みなら CAPTION_SOFT_WIDTH を上げてください。
+#
+# ★守ること
+#   文字は1字も足さない・消さない（入れるのは改行だけ）。_wrap_caption_text() の
+#   最後で必ず突き合わせます。言い回しの決めごとや時間帯の表現を壊さないためです。
+CAPTION_WRAP_WIDTH = 20.0
+# 文の終わり。いちばん強い切れ目として扱う。
+SENTENCE_END = set("。！？!?")
+
+# 目ざす形：読点のあとで改行／1行は短め／かぎかっこの中では割らない。
+# 下の値は、人が手で組んだキャプションと突き合わせて決めたものです。
+#
+# 1行の目安の幅。これを超えると減点（上限は CAPTION_WRAP_WIDTH のまま）。
+CAPTION_SOFT_WIDTH = 16.0
+# 目安を超えた分への重み（超過幅の2乗にかける）。
+CAPTION_OVER_WEIGHT = 2.0
+# 行の途中に読点が残ったときの減点。＝「読点のあとで改行しなかった」。
+CAPTION_INNER_COMMA_COST = 4.0
+# 短すぎる行（読点で終わる行は除く）への減点。「ただ、」のような転換語は単独行でよい。
+CAPTION_SHORT_MIN = 5.0
+CAPTION_SHORT_WEIGHT = 1.0
+# 開きかぎの手前は切ってよい（「先月ここで／「…」と」）。
+CAPTION_OPEN_QUOTE_PENALTY = 2.0
+# この幅以内のかぎかっこ（『自分のための時間』など）は中で割らない。
+CAPTION_QUOTE_MAX_WIDTH = 14.0
+CAPTION_QUOTE_PENALTY = 25.0
+# 閉じかぎの直後の助詞で割らない（「先週のバグ」／について、にしない）。
+CAPTION_CLOSE_QUOTE_PARTICLE_PENALTY = 30.0
+# 漢字＋送りがな＋漢字の複合語（入れ替わる・置き換える・取り組む）を割らない。
+CAPTION_COMPOUND_PENALTY = 30.0
+# 複合語の後ろ側の送りがなで割らない（『文章に置き換／わって』）。
+CAPTION_COMPOUND_TAIL_PENALTY = 40.0
+# 短い文節を行末に置き去りにしません。動詞に掛かる短い文節（手を・力を・先に）だけが
+# 行末に残ると読みにくいので（手を／動かす）、「手を動かす」の前で折ります。
+# 助詞で終わる文節がこの幅以内なら、そこで折ると減点。「の」は文節の区切りに数えません。
+# かぎかっこはまるごと1つの文節に数えます。
+CAPTION_SHORT_PHRASE_WIDTH = 3.0
+CAPTION_SHORT_PHRASE_PENALTY = 3.0
+# 指示語の手前は、ひらがなが続いていても文節の切れ目（食べながら／これを）。
+_CAPTION_DEMONSTRATIVES = {"これ", "それ", "あれ", "この", "その", "あの", "ここ", "そこ"}
+# 助詞のあとに続くひらがなの副詞の手前も文節の切れ目（余力は／ほぼ残っていません）。
+_CAPTION_HIRA_ADVERBS = ("ほぼ", "ほとんど", "まだ", "もう", "ずっと", "とても", "かなり",
+                         "あまり", "たぶん", "きっと", "すぐ", "もっと", "ちょっと", "なかなか",
+                         "ちゃんと")
+# 副詞の直後で折ると、副詞だけが行末に残ります（今日もちゃんと／出ています）。
+_CAPTION_OPEN_QUOTES = set("「『（(")
+_CAPTION_CLOSE_QUOTES = set("」』）)")
+_CAPTION_QUOTE_PAIRS = {"「": "」", "『": "』", "（": "）", "(": ")"}
+
+
+def _display_width(text: str) -> float:
+    """全角換算の表示幅。半角（ASCII・半角カナ）は 0.5 として数える。"""
+    return sum(0.5 if unicodedata.east_asian_width(ch) in "NaH" else 1.0
+               for ch in text)
+
+
+# 書き出しの「受け」を立てる最大の幅。これより長い文は独立させない。
+OPENING_BEAT_MAX_WIDTH = 12.0
+
+
+def _emphasize_opening_beat(caption: str) -> str:
+    """書き出しの短い「受け」を独立した段落にする。
+
+    ★何のために
+      書き出しが「読み手への問いかけ ＋ 自分の短い受け」の形のとき、
+
+        なにかやらなきゃと思って結局何もできなかったこと、
+        ありませんか。私はよくあります。          ← 受けが埋もれている
+
+      この「私はよくあります。」を空行で立てると、読み手の側に立った書き出しが
+      はっきりします。
+
+    ★かける範囲は1段落目だけ
+      この言い回しは書き出しの型なので、本文の途中まで広げると段落が細切れになる。
+
+    🔴 入れるのは改行だけ。文字は1字も足さない・消さない。
+    """
+    text = caption.strip()
+    if not text:
+        return text
+    paras = re.split(r"\n\s*\n", text)
+    first = " ".join(paras[0].split("\n")).strip()
+    sentences = [m.group(0).strip() for m in _SENTENCE_RE.finditer(first)]
+    sentences = [s for s in sentences if s]
+    if len(sentences) < 2:
+        return text                       # 1文だけの段落は触らない
+    last = sentences[-1]
+    if _display_width(last) > OPENING_BEAT_MAX_WIDTH:
+        return text                       # 長い文は「受け」ではない
+    head = "".join(sentences[:-1]).strip()
+    if not head:
+        return text
+    paras[0] = head + "\n\n" + last
+    return "\n\n".join(paras)
+
+
+def _one_sentence_per_paragraph(caption: str) -> str:
+    """1文ごとに段落を分ける。
+
+    ★何のために
+      スマホでは、2〜4文を1段落にまとめると塊が大きく見えます。「1段落＝1文」に
+      すると読みやすくなります。
+
+    🔴 入れるのは改行だけ。文字は1字も足さない・消さない。
+    """
+    text = caption.strip()
+    if not text:
+        return text
+    out: list[str] = []
+    for para in re.split(r"\n\s*\n", text):
+        joined = "".join(ln.strip() for ln in para.split("\n"))
+        if not joined:
+            continue
+        sentences = [m.group(0).strip() for m in _SENTENCE_RE.finditer(joined)]
+        sentences = [s for s in sentences if s]
+        out.extend(sentences or [joined])
+    return "\n\n".join(out)
+
+
+def _break_allowed(text: str, j: int) -> bool:
+    """text を text[:j] / text[j:] で折ってよいか（禁則）。"""
+    if j <= 0 or j >= len(text):
+        return False
+    if text[j] in LINE_HEAD_FORBIDDEN:
+        return False                      # 次の行頭が句読点・閉じ括弧・小書き文字
+    if text[j - 1] in LINE_TAIL_FORBIDDEN:
+        return False                      # 行末に開き括弧が取り残される
+    if text[j - 1] in DIGITS:
+        return False                      # 数字と助数詞が割れる（0／件）
+    return True
+
+
+def _break_penalty(text: str, j: int) -> float:
+    """そこで折ったときの読みにくさ。小さいほど自然な切れ目。
+
+    段落の末尾（j == len(text)）は折り目ではないので 0。
+    """
+    n = len(text)
+    if j >= n:
+        return 0.0
+    prev, nxt = text[j - 1], text[j]
+    if prev in SENTENCE_END:
+        return 0.0                        # 文の終わり
+    if prev in LINE_BREAK_PREFERRED:
+        return 1.0                        # 読点・閉じ括弧のあと
+    if (prev in PARTICLES and _char_class(nxt) != "hira"
+            and not (prev == "の" and j >= 2 and text[j - 2] in "こそあど")):
+        return 4.0                        # 助詞の直後＝文節の切れ目
+    cls_prev, cls_next = _char_class(prev), _char_class(nxt)
+    if cls_prev == "hira" and cls_next == "hira":
+        return 26.0                       # ひらがなの途中＝語を割る（いま／す）
+    if cls_prev != cls_next:
+        # 文字種の切替。ひらがなへ移るところは送りがな（置き／換わる）が多い。
+        return 20.0 if cls_next == "hira" else 8.0
+    return 22.0                           # 同じ文字種が続く途中
+
+
+def _caption_quote_inside(text: str, pref: list[float]) -> list[bool]:
+    """短いかぎかっこの「中」にあたる折り目の位置を True にする。"""
+    inside = [False] * (len(text) + 1)
+    stack: list[tuple[str, int]] = []
+    for i, ch in enumerate(text):
+        if ch in _CAPTION_QUOTE_PAIRS:
+            stack.append((ch, i))
+        elif stack and ch == _CAPTION_QUOTE_PAIRS[stack[-1][0]]:
+            _, s0 = stack.pop()
+            if pref[i + 1] - pref[s0] <= CAPTION_QUOTE_MAX_WIDTH:
+                for j in range(s0 + 1, i + 1):     # 開きの後〜閉じの前
+                    inside[j] = True
+    return inside
+
+
+def _wrap_caption_line(text: str, width: float) -> list[str]:
+    """1段落を幅 width 以内の行に折る。段落全体で「いちばん読みやすい割り方」を選ぶ。
+
+    ★なぜ幅いっぱいまで詰めないのか
+      幅いっぱいまで詰めてから切り位置を探すと、その範囲に自然な切れ目が1つも
+      無い段落で語尾が割れる（『ことがありま／す。』『文章に置き／換わって』）。
+      そこで、行ごとのコストと切れ目の悪さを足した合計が最小になる割り方を、
+      段落全体から選びます（Knuth-Plass と同じ考え方）。
+
+    ★点数のつけ方
+        - 目安の幅 CAPTION_SOFT_WIDTH を超えた分だけ減点
+        - 行の途中に読点が残ったら減点（＝読点のあとで改行する）
+        - 短いかぎかっこの中、閉じかぎの直後の助詞では割らない
+        - 短い文節（手を）を行末に置き去りにしない／複合語（置き換わる）を割らない
+    """
+    text = text.strip()
+    if not text or _display_width(text) <= CAPTION_SOFT_WIDTH:
+        return [text] if text else []
+
+    n = len(text)
+    pref = [0.0] * (n + 1)
+    comma = [0] * (n + 1)
+    for i, ch in enumerate(text):
+        pref[i + 1] = pref[i] + _display_width(ch)
+        comma[i + 1] = comma[i] + (1 if ch in "、，" else 0)
+    inside = _caption_quote_inside(text, pref)
+
+    def penalty(j: int) -> float:
+        if j >= n:
+            return 0.0
+        p = _break_penalty(text, j)
+        if text[j - 1] in _CAPTION_CLOSE_QUOTES and _char_class(text[j]) == "hira":
+            return CAPTION_CLOSE_QUOTE_PARTICLE_PENALTY
+        if text[j] in _CAPTION_OPEN_QUOTES and text[j - 1] not in _CAPTION_OPEN_QUOTES:
+            p = min(p, CAPTION_OPEN_QUOTE_PENALTY)
+        if inside[j]:
+            p += CAPTION_QUOTE_PENALTY
+        if (j >= 2 and _char_class(text[j - 2]) == "kanji"
+                and _char_class(text[j - 1]) == "hira" and text[j - 1] not in PARTICLES
+                and _char_class(text[j]) == "kanji"):
+            p = max(p, CAPTION_COMPOUND_PENALTY)   # 入れ／替わる
+        if (j >= 3 and _char_class(text[j - 3]) == "kanji"
+                and _char_class(text[j - 2]) == "hira" and text[j - 2] not in PARTICLES
+                and _char_class(text[j - 1]) == "kanji" and _char_class(text[j]) == "hira"):
+            p = max(p, CAPTION_COMPOUND_TAIL_PENALTY)   # 置き換／わる
+        if (text[j:j + 2] in _CAPTION_DEMONSTRATIVES and _char_class(text[j - 1]) == "hira"
+                and text[j - 1] not in "、，"):
+            p = min(p, 4.0)                              # 食べながら／これを
+        if (text[j - 1] in PARTICLES and text[j - 1] != "の"
+                and text.startswith(_CAPTION_HIRA_ADVERBS, j)):
+            p = min(p, 4.0)                              # 余力は／ほぼ残って
+        if any(text.endswith(a, 0, j) for a in _CAPTION_HIRA_ADVERBS):
+            p += CAPTION_SHORT_PHRASE_PENALTY             # ちゃんと／出ています
+        if text[j - 1] in PARTICLES and _char_class(text[j]) != "hira":
+            if short_phrase_before(j):
+                p += CAPTION_SHORT_PHRASE_PENALTY         # 手を／動かす
+        return p
+
+    def short_phrase_before(j: int) -> bool:
+        """j の手前の文節（助詞で終わる）が CAPTION_SHORT_PHRASE_WIDTH 以内か。"""
+        b, depth = j - 1, 0
+        while b > 0:
+            ch = text[b - 1]
+            if ch in _CAPTION_CLOSE_QUOTES:
+                depth += 1                # かぎかっこはまるごと1つの文節に数える
+            elif ch in _CAPTION_OPEN_QUOTES and depth:
+                depth -= 1
+            elif depth == 0 and (ch in "、，。！？"
+                                 or text[b:b + 2] in _CAPTION_DEMONSTRATIVES
+                                 or (ch in PARTICLES and ch != "の"
+                                     and _char_class(text[b]) != "hira")):
+                break
+            b -= 1
+        return pref[j] - pref[b] <= CAPTION_SHORT_PHRASE_WIDTH
+
+    def solve(strict: bool) -> list[str] | None:
+        INF = float("inf")
+        best = [INF] * (n + 1)
+        back = [0] * (n + 1)
+        best[0] = 0.0
+        for j in range(1, n + 1):
+            if j < n and strict and not _break_allowed(text, j):
+                continue                  # ここでは折れない
+            pen = penalty(j)
+            for i in range(j - 1, -1, -1):
+                if best[i] == INF:
+                    continue
+                lw = pref[j] - pref[i]
+                if lw > width:
+                    break                 # これ以上さかのぼると行が幅を超える
+                over = max(0.0, lw - CAPTION_SOFT_WIDTH)
+                cost = over * over * CAPTION_OVER_WEIGHT
+                # 行の途中（末尾以外）に読点が残っている＝そこで改行しなかった
+                cost += (comma[j - 1] - comma[i]) * CAPTION_INNER_COMMA_COST if j > i + 1 else 0.0
+                if lw < CAPTION_SHORT_MIN and text[j - 1] not in "、，" and j < n:
+                    cost += (CAPTION_SHORT_MIN - lw) ** 2 * CAPTION_SHORT_WEIGHT
+                total = best[i] + pen + cost
+                if total < best[j]:
+                    best[j] = total
+                    back[j] = i
+        if best[n] == INF:
+            return None
+        out, j = [], n
+        while j > 0:
+            out.append(text[back[j]:j])
+            j = back[j]
+        return out[::-1]
+
+    lines = solve(strict=True) or solve(strict=False)
+    if lines is None:                     # 1文字が幅を超えるなど、理論上ここには来ない
+        return [text]
+    return [ln for ln in lines if ln]
+
+
+def _wrap_caption_text(caption: str, width: float = CAPTION_WRAP_WIDTH) -> str:
+    """段落ごとに折り返す。段落の区切り（空行）はそのまま残す。
+
+    🔴 文字は1字も足さない・消さない。最後に突き合わせて、違っていたら
+       折り返す前の本文をそのまま返す（投稿を止めない）。
+    """
+    before = caption.strip()
+    if not before:
+        return before
+
+    out: list[str] = []
+    for para in re.split(r"\n\s*\n", before):
+        para = " ".join(para.split("\n")).strip()
+        if not para:
+            continue
+        out.append("\n".join(_wrap_caption_line(para, width)))
+    wrapped = "\n\n".join(out)
+
+    # 文字の同一性チェック（改行と、段落結合で落ちる空白だけを無視する）
+    def _bare(t: str) -> str:
+        return re.sub(r"[\s]", "", t)
+    if _bare(wrapped) != _bare(before):
+        print("⚠️ キャプションの折り返しで文字が変わったので、折り返さずに出します")
+        return before
+    return wrapped
+
+
 def _normalize_content(data: dict, pillar_key: str, weekend: bool) -> dict:
     """Claude/フォールバックの生データを投稿用 dict に整形する。"""
     mood = str(data.get("mood", "")).strip().lower()
@@ -710,6 +1115,15 @@ def _normalize_content(data: dict, pillar_key: str, weekend: bool) -> dict:
     # 品質チェック：中心メッセージに反する NG 表現を検出
     headline = _refine_wording(_enforce_central_message(headline, "headline", pillar_key))
     caption = _refine_wording(_enforce_central_message(caption, "caption", pillar_key))
+    # 語句の置換がすべて終わってから段落を保証する（置換で文がつながることがあるため）
+    caption = _ensure_paragraphs(caption)
+    # 書き出しの短い「受け」を独立させてから折り返す（段落の分割が先）
+    caption = _emphasize_opening_beat(caption)
+    # 1文ごとに段落を分ける
+    caption = _one_sentence_per_paragraph(caption)
+    # 段落が確定してから機械で折り返す（順序を逆にすると、折り返しで入れた改行を
+    # _ensure_paragraphs が段落の区切りと誤解して空行に格上げしてしまう）
+    caption = _wrap_caption_text(caption)
 
     return {
         "pillar": pillar_key,
@@ -807,7 +1221,41 @@ def _self_heal_violation(content: dict) -> str | None:
     return None
 
 
-def _find_violation(content: dict, weekend: bool, slot: str) -> tuple[str, str, str] | None:
+def _years_back(word: str) -> int:
+    """「去年」→1、「一昨年」→2、「3年前」→3。"""
+    if word in ("去年", "昨年", "前年"):
+        return 1
+    if word in ("一昨年", "おととし"):
+        return 2
+    m = re.match(r"([0-9０-９]+|[一二三四五六七八九十])", word)
+    n = m.group(1)
+    return _KANJI_DIGITS.get(n) or int(unicodedata.normalize("NFKC", n))
+
+
+def _year_violation(content: dict, today: datetime | None) -> str | None:
+    """仕組みの話の文に、実際の出来事が無い年（去年・◯年前）が出ていれば、その語を返す。
+
+    かぎかっこの中（「去年6月」と書いてしまった、のような引用）は通します。
+    ★これも網ではなく最後の砦です。本命はプロンプトに今日の日付を渡すこと（_facts_context）。
+    """
+    if today is None:
+        return None
+    years = episode_years()
+    text = f"{content['headline']}\n{content['caption']}"
+    for sentence in SENTENCE_SPLIT_RE.split(text):
+        if not sentence.strip():
+            continue
+        bare = re.sub(r"「[^」]*」|『[^』]*』", "", sentence)
+        if not any(w in bare for w in YEAR_SYSTEM_WORDS):
+            continue
+        for m in YEAR_PAST_RE.finditer(bare):
+            if today.year - _years_back(m.group(1)) not in years:
+                return m.group(1)
+    return None
+
+
+def _find_violation(content: dict, weekend: bool, slot: str,
+                    today: datetime | None = None) -> tuple[str, str, str] | None:
     """土日ガード・時間帯ガード・創作ガードをまとめて評価し、(種別, 検出語, 重さ) を返す。
 
     時間帯の違反は「存在しない時刻を書いた」等の事実誤りなので常に heavy。
@@ -825,6 +1273,9 @@ def _find_violation(content: dict, weekend: bool, slot: str) -> tuple[str, str, 
     if hit:
         return ("事実", hit, "heavy")
     hit = _self_heal_violation(content)
+    if hit:
+        return ("事実", hit, "heavy")
+    hit = _year_violation(content, today)
     if hit:
         return ("事実", hit, "heavy")
     return None
@@ -856,7 +1307,7 @@ def generate_content(pillar_key: str, date: datetime, slot: str = "A") -> dict:
     #   重い違反が残ったときだけです。軽い違反（対比としてなら正当な語）で
     #   予備の文章に落としてしまうと、AIが書いた文章より確実に平板になるうえ、
     #   同じ日の2つの枠が同じ文章になってしまうことがあります。
-    found = _find_violation(content, weekend, slot)
+    found = _find_violation(content, weekend, slot, date)
     if found:
         kind, hit, severity = found
         why = ("起きていない出来事を書いた疑いのある" if kind == "事実"
@@ -876,7 +1327,7 @@ def generate_content(pillar_key: str, date: datetime, slot: str = "A") -> dict:
             still = found          # 再生成できなかった＝初回の判定のまま
         else:
             content = content2
-            still = _find_violation(content2, weekend, slot)
+            still = _find_violation(content2, weekend, slot, date)
 
         if still is None:
             print("   → 再生成で解消")
@@ -978,12 +1429,22 @@ LINE_HEAD_FORBIDDEN = set(
     "ァィゥェォッャュョヮ"
     "ーゝゞ々〜"
 )
+# 行末禁則文字（行の末尾に置けない文字＝開き括弧。直後で改行すると
+# 「『仕』と『／組み』の話」のように開き括弧だけが行末に取り残されます）
+LINE_TAIL_FORBIDDEN = set("「『（｛【〈《〔［‘“([{")
 # 行末に来ると自然な区切り文字（この文字の直後での改行を優先する）
 # ※長音「ー」は語の途中なので入れない（「エー／ジェント」のような分断を避ける）
 LINE_BREAK_PREFERRED = set("、。，．！？!?…―」』）】")
 
+# 数字の直後では改行しません（数字＋助数詞・単位を1語として扱う。「エラー0／件」を防ぐ）。
+DIGITS = set("0123456789０１２３４５６７８９")
+# 助詞の直後は文節の切れ目なので改行してかまいません。ただし次の文字がひらがなのときは
+# 除きます（助詞でない同じ字を拾って「という」を「と／いう」で割ってしまうため）。
+# 「か」「ね」「よ」は文末寄りで語中に紛れやすいので入れていません。
+PARTICLES = set("のはがをにへとでもやらば")
 
-def wrap_japanese(text: str, max_chars: int) -> list[str]:
+
+def wrap_japanese(text: str, max_chars: int, max_lines: int = 3) -> list[str]:
     """見出しを読みやすく折り返す。
 
     従来は max_chars ちょうどで貪欲に改行していたため「休日も動いてる、仕／組みの話」
@@ -991,11 +1452,14 @@ def wrap_japanese(text: str, max_chars: int) -> list[str]:
       1. 行数をまず決め（総字数 ÷ max_chars を切り上げ）、各行の字数を均等に近づける。
       2. 句読点（、。！？など）の直後を改行位置として優先する。
       3. 行頭禁則文字が行頭に落ちる位置では改行しない（前行にぶら下げる）。
+      4. 開き括弧が行末に取り残される位置でも改行しない。
+      5. 3・4を守れる切り位置が1つも無いときは、行を1本増やして切り直す
+         （増やせる上限＝max_lines。見出しの描画は3行までなので既定は3）。
     明示改行（\\n）はそのまま尊重する。
     """
     lines: list[str] = []
     for segment in text.split("\n"):
-        lines.extend(_wrap_segment(segment, max_chars))
+        lines.extend(_wrap_segment(segment, max_chars, max_lines))
     return lines
 
 
@@ -1014,11 +1478,24 @@ def _char_class(ch: str) -> str:
     return "other"
 
 
-def _wrap_segment(text: str, max_chars: int) -> list[str]:
+def _wrap_segment(text: str, max_chars: int, max_lines: int = 3) -> list[str]:
     n = len(text)
     if n <= max_chars:
         return [text]
-    n_lines = -(-n // max_chars)          # 切り上げ除算＝必要な行数
+    base = -(-n // max_chars)             # 切り上げ除算＝必要な最小行数
+    # まず最小行数で、禁則を1つも破らずに切れるか試す。無理なら1行増やして試す
+    # （「設定を間違えて止まった（けど直った）」のように 9字×2 では
+    #   合法な切れ目が存在しない見出しがある）。
+    for n_lines in range(base, max(base, max_lines) + 1):
+        lines = _split(text, max_chars, n_lines, strict=True)
+        if lines is not None:
+            return lines
+    return _split(text, max_chars, base, strict=False)
+
+
+def _split(text: str, max_chars: int, n_lines: int, strict: bool) -> list[str] | None:
+    """n_lines 行ちょうどに割る。strict のとき、禁則を破らないと割れなければ None。"""
+    n = len(text)
     ideal_step = n / n_lines              # バランスを取るための1行あたり目安字数
     lines: list[str] = []
     start = 0
@@ -1034,17 +1511,32 @@ def _wrap_segment(text: str, max_chars: int) -> list[str]:
             nxt = text[b] if b < n else ""
             if nxt and nxt in LINE_HEAD_FORBIDDEN:
                 continue                  # 次行頭が禁則になる位置では切らない
+            if text[b - 1] in LINE_TAIL_FORBIDDEN:
+                continue                  # 行末が開き括弧になる位置では切らない
+            if text[b - 1] in DIGITS:
+                continue                  # 数字と助数詞のあいだでは切らない（0／件）
+            if text[b - 1] in "っッ":
+                continue                  # 促音で行を終えない（エージェントっ／て何？）
+            if (strict and _char_class(text[b - 1]) == _char_class(text[b])
+                    and _char_class(text[b]) in ("kata", "alnum")):
+                # カタカナ語・英単語の途中では切らない（「エージェン／トって何？」）。
+                # この行数で割れなければ、_wrap_segment が1行増やして切り直す。
+                continue
             score = -abs(b - ideal)       # 理想位置に近いほど高評価
             if text[b - 1] in LINE_BREAK_PREFERRED:
-                score += 3                # 句読点などの直後で切れると読みやすい
+                score += 5                # 句読点などの直後で切れると読みやすい
+            elif text[b - 1] in PARTICLES and _char_class(text[b]) != "hira":
+                score += 4                # 助詞の直後＝文節の切れ目（人の／生存戦略）
             elif _char_class(text[b - 1]) != _char_class(text[b]):
                 # 文字種の切替は語境界のことが多いが、漢字・カナ→ひらがなは
                 # 送りがな（仕組/み）や助詞の途中で割れやすいので加点しない。
                 score += -1 if _char_class(text[b]) == "hira" else 2
             if best_score is None or score > best_score:
                 best, best_score = b, score
-        if best is None:                  # 全候補が禁則で不可なら素直に最大字数で切る
-            best = min(start + max_chars, n)
+        if best is None:
+            if strict:
+                return None               # この行数では禁則を破らずに割れない
+            best = min(start + max_chars, n)  # 最後の手段（はみ出しだけは避ける）
         lines.append(text[start:best])
         start = best
     lines.append(text[start:])
